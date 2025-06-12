@@ -10,7 +10,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.scheduling.annotation.Async;
-
+import java.time.format.TextStyle;
+import java.util.Locale;
+import java.time.format.DateTimeFormatter;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -268,13 +270,14 @@ public class FileProcessorService {
                     break;
                 case DATE:
                     LocalDate date = parseLocalDate(trimmedValue);
-                    salesData.setDate(date);
-                    logger.debug("    Set Date: '{}' -> {}", trimmedValue, date);
-                    // Derive month_number and year directly from the parsed date
                     if (date != null) {
+                        salesData.setDate(date);
                         salesData.setMonthNumber(date.getMonthValue());
+                        salesData.setMonthName(date.getMonth().getDisplayName(TextStyle.FULL, Locale.ENGLISH));
                         salesData.setYear(date.getYear());
-                        logger.debug("    Derived Month Number: {} and Year: {} from Date: {}", date.getMonthValue(), date.getYear(), date);
+                        logger.debug("Set Date: {} -> Month: {}, Year: {}", date, date.getMonthValue(), date.getYear());
+                    } else {
+                        logger.warn("Failed to parse date from value: {}", trimmedValue);
                     }
                     break;
                 case MONTH_NUMBER:
@@ -386,39 +389,42 @@ public class FileProcessorService {
             return null;
         }
         String trimmedValue = value.trim();
-        // Define preferred format first, then other common ones for fallback
-        String[] formats = {
-            "dd/MM/yyyy", // Primary format as specified by user
-            "yyyy-MM-dd",
-            "MM/dd/yyyy",
-            "yyyy/MM/dd",
-            "MM-dd-yyyy",
-            "dd-MM-yyyy"
-        };
 
+        // Try parsing with ISO_LOCAL_DATE_TIME first, as it handles 'YYYY-MM-DDTHH:mm'
         try {
-            for (String format : formats) {
-                try {
-                    return LocalDate.parse(trimmedValue, DateTimeFormatter.ofPattern(format));
-                } catch (DateTimeParseException ignored) {
-                    // Try next format
-                }
-            }
-            
-            // If none of the string formats work, try to extract date from Excel numeric value
-            try {
-                double excelDate = Double.parseDouble(trimmedValue);
-                return LocalDate.of(1900, 1, 1).plusDays((long) excelDate - 2);
-            } catch (NumberFormatException ignored) {
-                // Not an Excel date
-            }
-            
-            logger.error("Could not parse date '{}' with any specified format or as Excel numeric.", value);
-            return null;
-        } catch (Exception e) {
-            logger.error("Unexpected error parsing date from: '{}'. Error: {}", value, e.getMessage());
-            return null;
+            LocalDate date = LocalDate.parse(trimmedValue, DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+            logger.debug("    Value '{}' is a LocalDate with ISO_LOCAL_DATE_TIME format.", value);
+            return date;
+        } catch (DateTimeParseException ignored) {
+            // Fallback to other formats if ISO_LOCAL_DATE_TIME fails
         }
+
+        for (String format : ColumnGuessingService.getDateFormatStrings()) {
+            try {
+                LocalDate date = LocalDate.parse(trimmedValue, DateTimeFormatter.ofPattern(format));
+                logger.debug("    Value '{}' is a LocalDate with format {}", value, format);
+                return date;
+            } catch (DateTimeParseException ignored) {
+                // Try next format
+            }
+        }
+
+        // Also try to parse as Excel numeric date
+        try {
+            double excelDate = Double.parseDouble(trimmedValue);
+            // Check for a reasonable range for Excel dates (e.g., between 1900-01-01 and 2100-01-01)
+            // Excel's epoch is 1900-01-01, which is day 1. Max reasonable date around 2070 is ~70000.
+            if (excelDate > 0 && excelDate < 100000) { 
+                // Convert Excel numeric date to Java LocalDate
+                LocalDate date = LocalDate.of(1899, 12, 31).plusDays((long) excelDate);
+                logger.debug("    Value '{}' is an Excel numeric date, parsed to {}.", value, date);
+                return date;
+            }
+        } catch (NumberFormatException ignored) {
+            // Not an Excel date
+        }
+        logger.error("Could not parse date '{}' with any specified format or as Excel numeric.", value);
+        return null;
     }
 
     private String getCellValueAsString(Cell cell) {
@@ -430,13 +436,24 @@ public class FileProcessorService {
                 return cell.getStringCellValue();
             case NUMERIC:
                 if (DateUtil.isCellDateFormatted(cell)) {
-                    return cell.getLocalDateTimeCellValue().toString();
+                    try {
+                        java.time.LocalDateTime dateTime = cell.getLocalDateTimeCellValue();
+                        return dateTime.toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE); // Ensures YYYY-MM-DD format
+                    } catch (Exception e) {
+                        logger.error("Error parsing date from cell: {}", e.getMessage());
+                        return "";
+                    }
                 }
-                return String.valueOf(cell.getNumericCellValue());
+                // Use DecimalFormat to avoid scientific notation
+                return new java.text.DecimalFormat("#").format(cell.getNumericCellValue());
             case BOOLEAN:
                 return String.valueOf(cell.getBooleanCellValue());
             case FORMULA:
-                return cell.getCellFormula();
+                try {
+                    return String.valueOf(cell.getNumericCellValue());
+                } catch (Exception e) {
+                    return cell.getStringCellValue();
+                }
             default:
                 return "";
         }
@@ -448,4 +465,4 @@ public class FileProcessorService {
         }
         return fileName.substring(fileName.lastIndexOf('.') + 1);
     }
-} 
+}

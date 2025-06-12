@@ -29,8 +29,13 @@ public class ColumnGuessingService {
         "MM/dd/yyyy",
         "yyyy/MM/dd",
         "MM-dd-yyyy",
-        "dd-MM-yyyy"
+        "dd-MM-yyyy",
+        "yyyy-MM-dd'T'HH:mm" // Add this format for dates with time component
     };
+
+    public static String[] getDateFormatStrings() {
+        return DATE_FORMATS;
+    }
 
     /**
      * Guesses the mapping of column index to SalesColumn based on sample data and an optional header row.
