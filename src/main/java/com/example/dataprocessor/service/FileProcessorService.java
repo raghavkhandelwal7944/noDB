@@ -1,5 +1,9 @@
 package com.example.dataprocessor.service;
-
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ExecutorService;
 import com.example.dataprocessor.model.SalesData;
 import com.example.dataprocessor.repository.SalesDataRepository;
 import org.apache.poi.ss.usermodel.*;
@@ -34,12 +38,35 @@ import java.io.InputStream;
 import java.util.HashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CompletableFuture;
+import java.util.ArrayList;
 
 @Service
+@org.springframework.scheduling.annotation.EnableAsync
 public class FileProcessorService {
-
     private static final Logger logger = LoggerFactory.getLogger(FileProcessorService.class);
+    
+    // Add these field declarations
+    private final AtomicInteger totalProcessedRows = new AtomicInteger(0);
+    private final AtomicInteger totalFailedRows = new AtomicInteger(0);
+    
+    // Replace logProcess with this method
+    private void logProgress(int currentRow, int totalRows) {
+        if (currentRow % 500 == 0) {
+            logger.info("Processing progress: {} of {} rows ({} failed)", 
+                currentRow, 
+                totalRows,
+                totalFailedRows.get());
+        }
+    }
+    private static final int CHUNK_SIZE = 500;
+    private static final int HEADER_SAMPLE_ROWS = 10;
 
+    // Add missing field declarations
+    private final AtomicInteger processedRowsCounter;
+    private final AtomicInteger failedRowsCounter;
+    
     @Autowired
     private SalesDataRepository salesDataRepository;
 
@@ -49,14 +76,28 @@ public class FileProcessorService {
     @Autowired
     private FileTrackerService fileTrackerService;
 
-    @Autowired
-    private ExecutorService taskExecutor; // Inject the configured ExecutorService
+    // Define ExecutorService bean
+    private final ExecutorService taskExecutor;
 
-    private static final int CHUNK_SIZE = 500;
-    private static final int HEADER_SAMPLE_ROWS = 10;
+    // Add constructor to initialize counters and executor
+    @Autowired
+    public FileProcessorService(@Qualifier("taskExecutor") ExecutorService taskExecutor) {
+        this.taskExecutor = taskExecutor;
+        this.processedRowsCounter = new AtomicInteger(0);
+        this.failedRowsCounter = new AtomicInteger(0);
+    }
+
+    // Remove @Async since we're using explicit ExecutorService
+    
 
     @Async
     public void processFile(MultipartFile file, Long fileStatusId) throws IOException, CsvValidationException, InterruptedException {
+        // Reset counters at start
+        totalProcessedRows.set(0);
+        totalFailedRows.set(0);
+        processedRowsCounter.set(0);
+        failedRowsCounter.set(0);
+        
         logger.info("Starting to process file: {} with ID: {}", file.getOriginalFilename(), fileStatusId);
         List<List<String>> allRows = new ArrayList<>();
         String fileExtension = getFileExtension(file.getOriginalFilename());
@@ -104,50 +145,109 @@ public class FileProcessorService {
         logger.info("Guessed column mapping: {}", columnMapping);
 
         long startTime = System.currentTimeMillis();
-        int totalProcessedRows = 0;
-        int totalFailedRows = 0;
+
+        // Create a list to hold all futures
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         // Process in chunks
         for (int i = 0; i < allRows.size(); i += CHUNK_SIZE) {
             List<List<String>> chunk = allRows.subList(i, Math.min(i + CHUNK_SIZE, allRows.size()));
-            final int chunkStartIndex = i; // For logging purposes
-            taskExecutor.submit(() -> {
+            final int chunkStartIndex = i;
+            
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                 logger.debug("Processing chunk starting at row: {}", chunkStartIndex);
                 List<SalesData> salesDataList = new ArrayList<>();
-                int chunkFailedRows = 0;
+                
                 for (List<String> row : chunk) {
-                    SalesData salesData = mapRowToSalesData(row, columnMapping);
-                    if (salesData != null) {
-                        salesDataList.add(salesData);
-                    } else {
-                        chunkFailedRows++;
-                        logger.warn("Failed to map a row to SalesData. Row data: {}", row);
+                    try {
+                        SalesData salesData = mapRowToSalesData(row, columnMapping);
+                        if (salesData != null) {
+                            salesDataList.add(salesData);
+                            processedRowsCounter.incrementAndGet();
+                        } else {
+                            failedRowsCounter.incrementAndGet();
+                            logger.warn("Failed to map row at index {}: {}", chunkStartIndex + chunk.indexOf(row), row);
+                        }
+                        
+                        // Log progress every 500 rows
+                        logProgress(processedRowsCounter.get(), allRows.size());
+                        
+                    } catch (Exception e) {
+                        failedRowsCounter.incrementAndGet();
+                        logger.error("Error processing row at index {}: {}", chunkStartIndex + chunk.indexOf(row), e.getMessage());
                     }
                 }
-                salesDataRepository.saveAll(salesDataList);
-                logger.debug("Saved {} SalesData entities from chunk starting at row: {}", salesDataList.size(), chunkStartIndex);
-                // TODO: Need thread-safe way to update totalProcessedRows and totalFailedRows across chunks
-                // For now, these totals will reflect only the main thread's count or require more complex Futures handling
-            });
+                
+                try {
+                    salesDataRepository.saveAll(salesDataList);
+                    logger.debug("Saved {} SalesData entities from chunk starting at row: {}", salesDataList.size(), chunkStartIndex);
+                } catch (Exception e) {
+                    logger.error("Error saving chunk starting at row {}: {}", chunkStartIndex, e.getMessage());
+                    failedRowsCounter.addAndGet(salesDataList.size());
+                    processedRowsCounter.addAndGet(-salesDataList.size());
+                }
+            }, taskExecutor);
+            
+            futures.add(future);
         }
-
-        // Instead of shutting down the executor, we assume it's managed by Spring.
-        // We still need to await completion of *these specific tasks* if we want to update stats reliably immediately.
-        // However, with @Async on processFile, this method returns quickly.
-        // A more robust solution for overall stats would involve a FileProcessingStatus update from each chunk or a final check.
-
-        // For now, let's simplify the immediate stats update and assume success if no rejections
-        // The actual stats update should happen after all sub-tasks complete. This requires a different async pattern (e.g., CompletableFuture.allOf)
-        // For demonstration, we'll update based on assumed success of submitted tasks.
-        // Actual implementation would need to track futures for precise counts.
-        totalProcessedRows = allRows.size(); // Simplistic assumption if all chunks were submitted
-
+        
+        // Wait for all chunks to complete
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        
+        // Update final statistics
         long durationSeconds = (System.currentTimeMillis() - startTime) / 1000;
-        fileTrackerService.updateProcessingStats(fileTrackerService.getFileStatusById(fileStatusId).orElse(null), rawRows.size(), totalProcessedRows, totalFailedRows, durationSeconds);
-        fileTrackerService.updateFileStatus(fileStatusId, "COMPLETED", null);
-        logger.info("File processing completed for file: {} (ID: {}). Total processed rows: {}, Total failed rows: {}. Duration: {} seconds.", 
-            file.getOriginalFilename(), fileStatusId, totalProcessedRows, totalFailedRows, durationSeconds);
+        int totalProcessed = processedRowsCounter.get();
+        int totalFailed = failedRowsCounter.get();
+        
+        fileTrackerService.updateProcessingStats(
+            fileTrackerService.getFileStatusById(fileStatusId).orElse(null),
+            rawRows.size(),
+            totalProcessed,
+            totalFailed,
+            durationSeconds
+        );
+        
+        fileTrackerService.updateFileStatus(fileStatusId, "COMPLETED", 
+            totalFailed > 0 ? String.format("%d rows failed to process", totalFailed) : null);
+            
+        logger.info("File processing completed for file: {} (ID: {}). Total processed: {}, Failed: {}. Duration: {} seconds.", 
+            file.getOriginalFilename(), fileStatusId, totalProcessed, totalFailed, durationSeconds);
     }
+
+    private void processChunk(List<List<String>> chunk, int startIndex, Map<Integer, SalesColumn> columnMapping) {
+        List<SalesData> salesDataList = new ArrayList<>();
+        
+        for (List<String> row : chunk) {
+            try {
+                SalesData salesData = mapRowToSalesData(row, columnMapping);
+                if (salesData != null) {
+                    salesDataList.add(salesData);
+                    totalProcessedRows.incrementAndGet();
+                    
+                    // Log progress every 500 rows
+                    int processed = totalProcessedRows.get();
+                    if (processed % 500 == 0) {
+                        logger.info("Processed {} rows", processed);
+                    }
+                } else {
+                    totalFailedRows.incrementAndGet();
+                    logger.warn("Failed to map row at index {}", startIndex + chunk.indexOf(row));
+                }
+            } catch (Exception e) {
+                totalFailedRows.incrementAndGet();
+                logger.error("Error processing row at index {}: {}", startIndex + chunk.indexOf(row), e.getMessage());
+            }
+        }
+        
+        try {
+            salesDataRepository.saveAll(salesDataList);
+        } catch (Exception e) {
+            totalFailedRows.addAndGet(salesDataList.size());
+            totalProcessedRows.addAndGet(-salesDataList.size());
+            logger.error("Error saving chunk starting at index {}: {}", startIndex, e.getMessage());
+        }
+    }
+
 
     private List<List<String>> readExcelFileRaw(MultipartFile file) throws IOException {
         try (InputStream inputStream = file.getInputStream()) {
@@ -431,31 +531,37 @@ public class FileProcessorService {
         if (cell == null) {
             return "";
         }
-        switch (cell.getCellType()) {
-            case STRING:
-                return cell.getStringCellValue();
-            case NUMERIC:
-                if (DateUtil.isCellDateFormatted(cell)) {
-                    try {
-                        java.time.LocalDateTime dateTime = cell.getLocalDateTimeCellValue();
-                        return dateTime.toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE); // Ensures YYYY-MM-DD format
-                    } catch (Exception e) {
-                        logger.error("Error parsing date from cell: {}", e.getMessage());
-                        return "";
-                    }
-                }
-                // Use DecimalFormat to avoid scientific notation
-                return new java.text.DecimalFormat("#").format(cell.getNumericCellValue());
-            case BOOLEAN:
-                return String.valueOf(cell.getBooleanCellValue());
-            case FORMULA:
-                try {
-                    return String.valueOf(cell.getNumericCellValue());
-                } catch (Exception e) {
+        try {
+            switch (cell.getCellType()) {
+                case STRING:
                     return cell.getStringCellValue();
-                }
-            default:
-                return "";
+                case NUMERIC:
+                    if (DateUtil.isCellDateFormatted(cell)) {
+                        return cell.getLocalDateTimeCellValue()
+                                  .toLocalDate()
+                                  .format(DateTimeFormatter.ISO_LOCAL_DATE);
+                    }
+                    // Avoid scientific notation
+                    return new java.text.DecimalFormat("#.##########").format(cell.getNumericCellValue());
+                case BOOLEAN:
+                    return String.valueOf(cell.getBooleanCellValue());
+                case FORMULA:
+                    try {
+                        return new java.text.DecimalFormat("#.##########").format(cell.getNumericCellValue());
+                    } catch (Exception e) {
+                        try {
+                            return cell.getStringCellValue();
+                        } catch (Exception ex) {
+                            logger.error("Error evaluating formula: {}", ex.getMessage());
+                            return "";
+                        }
+                    }
+                default:
+                    return "";
+            }
+        } catch (Exception e) {
+            logger.error("Error getting cell value: {}", e.getMessage());
+            return "";
         }
     }
 
