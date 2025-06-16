@@ -41,6 +41,7 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CompletableFuture;
 import java.util.ArrayList;
+import java.util.concurrent.ExecutionException;
 
 @Service
 @org.springframework.scheduling.annotation.EnableAsync
@@ -53,7 +54,7 @@ public class FileProcessorService {
     
     // Replace logProcess with this method
     private void logProgress(int currentRow, int totalRows) {
-        if (currentRow % 500 == 0) {
+        if (currentRow % 5000 == 0) {  // Changed from 500 to 5000 to reduce logging frequency
             logger.info("Processing progress: {} of {} rows ({} failed)", 
                 currentRow, 
                 totalRows,
@@ -87,131 +88,116 @@ public class FileProcessorService {
         this.failedRowsCounter = new AtomicInteger(0);
     }
 
-    // Remove @Async since we're using explicit ExecutorService
-    
-
     @Async
-    public void processFile(MultipartFile file, Long fileStatusId) throws IOException, CsvValidationException, InterruptedException {
+    public void processFile(MultipartFile file, Long fileStatusId) throws IOException, CsvValidationException, InterruptedException, ExecutionException {
         // Reset counters at start
         totalProcessedRows.set(0);
         totalFailedRows.set(0);
         processedRowsCounter.set(0);
         failedRowsCounter.set(0);
         
-        logger.info("Starting to process file: {} with ID: {}", file.getOriginalFilename(), fileStatusId);
-        List<List<String>> allRows = new ArrayList<>();
-        String fileExtension = getFileExtension(file.getOriginalFilename());
-
-        boolean hasHeader = false;
-        List<List<String>> rawRows = new ArrayList<>();
-
-        if ("xlsx".equalsIgnoreCase(fileExtension)) {
-            logger.info("Reading Excel file raw data.");
-            rawRows = readExcelFileRaw(file);
-        } else if ("csv".equalsIgnoreCase(fileExtension)) {
-            logger.info("Reading CSV file raw data.");
-            rawRows = readCsvFileRaw(file);
-        } else {
-            logger.error("Unsupported file type: {}", fileExtension);
-            throw new IllegalArgumentException("Unsupported file type: " + fileExtension);
-        }
-
-        if (rawRows.isEmpty()) {
-            logger.warn("No data found in file: {}", file.getOriginalFilename());
-            fileTrackerService.updateFileStatus(fileStatusId, "COMPLETED", "No data found in file.");
-            return;
-        }
-
-        List<String> firstRow = rawRows.get(0);
-        logger.info("First row of the file: {}", firstRow);
-        if (columnGuessingService.isLikelyHeader(firstRow)) {
-            hasHeader = true;
-            allRows.addAll(rawRows.subList(1, rawRows.size()));
-            logger.info("Header detected. {} data rows remain after header.", allRows.size());
-        } else {
-            allRows.addAll(rawRows);
-            logger.info("No header detected. {} data rows remain.", allRows.size());
-        }
-
-        if (allRows.isEmpty()) {
-            logger.warn("No data rows after header check for file: {}", file.getOriginalFilename());
-            fileTrackerService.updateFileStatus(fileStatusId, "COMPLETED", "No data rows after header check.");
-            return;
-        }
-
-        List<List<String>> sampleRowsForGuessing = allRows.stream().limit(HEADER_SAMPLE_ROWS).collect(Collectors.toList());
-        logger.info("Using {} sample rows for column guessing.", sampleRowsForGuessing.size());
-        Map<Integer, SalesColumn> columnMapping = columnGuessingService.guessColumns(sampleRowsForGuessing, hasHeader ? Optional.of(firstRow) : Optional.empty());
-        logger.info("Guessed column mapping: {}", columnMapping);
-
         long startTime = System.currentTimeMillis();
+        logger.info("Starting to process file: {} with ID: {}", file.getOriginalFilename(), fileStatusId);
+        
+        try {
+            List<List<String>> allRows = new ArrayList<>();
+            String fileExtension = getFileExtension(file.getOriginalFilename());
 
-        // Create a list to hold all futures
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+            boolean hasHeader = false;
+            List<List<String>> rawRows = new ArrayList<>();
 
-        // Process in chunks
-        for (int i = 0; i < allRows.size(); i += CHUNK_SIZE) {
-            List<List<String>> chunk = allRows.subList(i, Math.min(i + CHUNK_SIZE, allRows.size()));
-            final int chunkStartIndex = i;
-            
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                logger.debug("Processing chunk starting at row: {}", chunkStartIndex);
-                List<SalesData> salesDataList = new ArrayList<>();
+            if ("xlsx".equalsIgnoreCase(fileExtension)) {
+                logger.info("Reading Excel file raw data.");
+                rawRows = readExcelFileRaw(file);
+            } else if ("csv".equalsIgnoreCase(fileExtension)) {
+                logger.info("Reading CSV file raw data.");
+                rawRows = readCsvFileRaw(file);
+            } else {
+                logger.error("Unsupported file type: {}", fileExtension);
+                throw new IllegalArgumentException("Unsupported file type: " + fileExtension);
+            }
+
+            if (rawRows.isEmpty()) {
+                logger.warn("No data found in file: {}", file.getOriginalFilename());
+                fileTrackerService.updateFileStatus(fileStatusId, "COMPLETED", "No data found in file.");
+                return;
+            }
+
+            List<String> firstRow = rawRows.get(0);
+            if (columnGuessingService.isLikelyHeader(firstRow)) {
+                hasHeader = true;
+                allRows.addAll(rawRows.subList(1, rawRows.size()));
+            } else {
+                allRows.addAll(rawRows);
+            }
+
+            // Get column mapping
+            Map<Integer, SalesColumn> columnMapping = columnGuessingService.guessColumns(
+                allRows.subList(0, Math.min(HEADER_SAMPLE_ROWS, allRows.size())),
+                hasHeader ? Optional.of(firstRow) : Optional.empty()
+            );
+
+            // Process in chunks
+            for (int i = 0; i < allRows.size(); i += CHUNK_SIZE) {
+                List<List<String>> chunk = allRows.subList(i, Math.min(i + CHUNK_SIZE, allRows.size()));
+                final int chunkStartIndex = i;
                 
-                for (List<String> row : chunk) {
-                    try {
-                        SalesData salesData = mapRowToSalesData(row, columnMapping);
-                        if (salesData != null) {
-                            salesDataList.add(salesData);
-                            processedRowsCounter.incrementAndGet();
-                        } else {
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    List<SalesData> salesDataList = new ArrayList<>();
+                    
+                    for (List<String> row : chunk) {
+                        try {
+                            SalesData salesData = mapRowToSalesData(row, columnMapping);
+                            if (salesData != null) {
+                                salesDataList.add(salesData);
+                                processedRowsCounter.incrementAndGet();
+                            } else {
+                                failedRowsCounter.incrementAndGet();
+                            }
+                            
+                            logProgress(processedRowsCounter.get(), allRows.size());
+                            
+                        } catch (Exception e) {
                             failedRowsCounter.incrementAndGet();
-                            logger.warn("Failed to map row at index {}: {}", chunkStartIndex + chunk.indexOf(row), row);
                         }
-                        
-                        // Log progress every 500 rows
-                        logProgress(processedRowsCounter.get(), allRows.size());
-                        
-                    } catch (Exception e) {
-                        failedRowsCounter.incrementAndGet();
-                        logger.error("Error processing row at index {}: {}", chunkStartIndex + chunk.indexOf(row), e.getMessage());
                     }
-                }
+                    
+                    try {
+                        salesDataRepository.saveAll(salesDataList);
+                    } catch (Exception e) {
+                        failedRowsCounter.addAndGet(salesDataList.size());
+                        processedRowsCounter.addAndGet(-salesDataList.size());
+                    }
+                }, taskExecutor);
                 
-                try {
-                    salesDataRepository.saveAll(salesDataList);
-                    logger.debug("Saved {} SalesData entities from chunk starting at row: {}", salesDataList.size(), chunkStartIndex);
-                } catch (Exception e) {
-                    logger.error("Error saving chunk starting at row {}: {}", chunkStartIndex, e.getMessage());
-                    failedRowsCounter.addAndGet(salesDataList.size());
-                    processedRowsCounter.addAndGet(-salesDataList.size());
-                }
-            }, taskExecutor);
+                future.get();
+            }
+
+            long endTime = System.currentTimeMillis();
+            long duration = endTime - startTime;
+            String durationMessage = String.format(
+                "File processing completed in %d seconds. Processed %d rows, %d failed rows.",
+                duration / 1000,
+                processedRowsCounter.get(),
+                failedRowsCounter.get()
+            );
             
-            futures.add(future);
+            fileTrackerService.updateFileStatus(fileStatusId, "COMPLETED", durationMessage);
+            logger.info(durationMessage);
+            
+        } catch (Exception e) {
+            long endTime = System.currentTimeMillis();
+            long duration = endTime - startTime;
+            String errorMessage = String.format(
+                "File processing failed after %d seconds. Error: %s",
+                duration / 1000,
+                e.getMessage()
+            );
+            
+            fileTrackerService.updateFileStatus(fileStatusId, "FAILED", errorMessage);
+            logger.error(errorMessage);
+            throw e;
         }
-        
-        // Wait for all chunks to complete
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        
-        // Update final statistics
-        long durationSeconds = (System.currentTimeMillis() - startTime) / 1000;
-        int totalProcessed = processedRowsCounter.get();
-        int totalFailed = failedRowsCounter.get();
-        
-        fileTrackerService.updateProcessingStats(
-            fileTrackerService.getFileStatusById(fileStatusId).orElse(null),
-            rawRows.size(),
-            totalProcessed,
-            totalFailed,
-            durationSeconds
-        );
-        
-        fileTrackerService.updateFileStatus(fileStatusId, "COMPLETED", 
-            totalFailed > 0 ? String.format("%d rows failed to process", totalFailed) : null);
-            
-        logger.info("File processing completed for file: {} (ID: {}). Total processed: {}, Failed: {}. Duration: {} seconds.", 
-            file.getOriginalFilename(), fileStatusId, totalProcessed, totalFailed, durationSeconds);
     }
 
     private void processChunk(List<List<String>> chunk, int startIndex, Map<Integer, SalesColumn> columnMapping) {
@@ -284,7 +270,6 @@ public class FileProcessorService {
     private SalesData mapRowToSalesData(List<String> row, Map<Integer, SalesColumn> columnMapping) {
         SalesData salesData = new SalesData();
         boolean isEmptyRow = true;
-        logger.debug("Mapping row: {}", row);
         try {
             for (Map.Entry<Integer, SalesColumn> entry : columnMapping.entrySet()) {
                 Integer colIdx = entry.getKey();
@@ -292,21 +277,15 @@ public class FileProcessorService {
 
                 if (colIdx < row.size()) {
                     String cellValue = row.get(colIdx);
-                    logger.debug("  Column: {}, Index: {}, Raw Value: '{}'", salesColumn.getColumnName(), colIdx, cellValue);
                     if (cellValue != null && !cellValue.trim().isEmpty()) {
                         isEmptyRow = false;
                     }
                     setSalesDataField(salesData, salesColumn, cellValue);
-                } else {
-                    logger.debug("  Column: {} (Index: {}), value out of bounds for row (size: {}). Skipping.", salesColumn.getColumnName(), colIdx, row.size());
                 }
-            }
-            if (isEmptyRow) {
-                logger.debug("Row is empty, returning null.");
             }
             return isEmptyRow ? null : salesData;
         } catch (Exception e) {
-            logger.error("Error mapping row to SalesData: {}", row, e);
+            logger.error("Error mapping row to SalesData: {}", e.getMessage());
             return null;
         }
     }
@@ -331,42 +310,34 @@ public class FileProcessorService {
                 case UNITS_SOLD:
                     BigDecimal unitsSold = parseBigDecimal(trimmedValue);
                     salesData.setUnitsSold(unitsSold);
-                    logger.debug("    Set Units Sold: '{}' -> {}", trimmedValue, unitsSold);
                     break;
                 case MANUFACTURING_PRICE:
                     BigDecimal manufacturingPrice = parseBigDecimal(trimmedValue);
                     salesData.setManufacturingPrice(manufacturingPrice);
-                    logger.debug("    Set Manufacturing Price: '{}' -> {}", trimmedValue, manufacturingPrice);
                     break;
                 case SALE_PRICE:
                     BigDecimal salePrice = parseBigDecimal(trimmedValue);
                     salesData.setSalePrice(salePrice);
-                    logger.debug("    Set Sale Price: '{}' -> {}", trimmedValue, salePrice);
                     break;
                 case GROSS_SALES:
                     BigDecimal grossSales = parseBigDecimal(trimmedValue);
                     salesData.setGrossSales(grossSales);
-                    logger.debug("    Set Gross Sales: '{}' -> {}", trimmedValue, grossSales);
                     break;
                 case DISCOUNTS:
                     BigDecimal discounts = parseBigDecimal(trimmedValue);
                     salesData.setDiscounts(discounts);
-                    logger.debug("    Set Discounts: '{}' -> {}", trimmedValue, discounts);
                     break;
                 case SALES:
                     BigDecimal sales = parseBigDecimal(trimmedValue);
                     salesData.setSales(sales);
-                    logger.debug("    Set Sales: '{}' -> {}", trimmedValue, sales);
                     break;
                 case COGS:
                     BigDecimal cogs = parseBigDecimal(trimmedValue);
                     salesData.setCogs(cogs);
-                    logger.debug("    Set COGS: '{}' -> {}", trimmedValue, cogs);
                     break;
                 case PROFIT:
                     BigDecimal profit = parseBigDecimal(trimmedValue);
                     salesData.setProfit(profit);
-                    logger.debug("    Set Profit: '{}' -> {}", trimmedValue, profit);
                     break;
                 case DATE:
                     LocalDate date = parseLocalDate(trimmedValue);
@@ -375,62 +346,11 @@ public class FileProcessorService {
                         salesData.setMonthNumber(date.getMonthValue());
                         salesData.setMonthName(date.getMonth().getDisplayName(TextStyle.FULL, Locale.ENGLISH));
                         salesData.setYear(date.getYear());
-                        logger.debug("Set Date: {} -> Month: {}, Year: {}", date, date.getMonthValue(), date.getYear());
-                    } else {
-                        logger.warn("Failed to parse date from value: {}", trimmedValue);
                     }
-                    break;
-                case MONTH_NUMBER:
-                    // This case is now redundant if month_number is always derived from date
-                    // If month_number can be an independent column, this logic needs re-evaluation.
-                    // For now, assuming derivation from Date.
-                    // Integer monthNumber = parseInteger(trimmedValue);
-                    // salesData.setMonthNumber(monthNumber);
-                    // logger.debug("    Set Month Number: '{}' -> {}", trimmedValue, monthNumber);
-                    break;
-                case MONTH_NAME:
-                    salesData.setMonthName(trimmedValue);
-                    break;
-                case YEAR:
-                    // This case is now redundant if year is always derived from date
-                    // If year can be an independent column, this logic needs re-evaluation.
-                    // For now, assuming derivation from Date.
-                    // Integer year = parseInteger(trimmedValue);
-                    // salesData.setYear(year);
-                    // logger.debug("    Set Year: '{}' -> {}", trimmedValue, year);
                     break;
             }
         } catch (Exception e) {
-            logger.error("Error setting field {} with value '{}'", column, trimmedValue, e);
-            setFieldToNull(salesData, column);
-        }
-    }
-
-    // Helper method to set fields to null based on their type
-    private void setFieldToNull(SalesData salesData, SalesColumn column) {
-        switch (column.getDataType().getName()) {
-            case "java.math.BigDecimal":
-                salesData.setUnitsSold(null); 
-                salesData.setManufacturingPrice(null);
-                salesData.setSalePrice(null);
-                salesData.setGrossSales(null);
-                salesData.setDiscounts(null);
-                salesData.setSales(null);
-                salesData.setCogs(null);
-                salesData.setProfit(null);
-                break;
-            case "java.time.LocalDate":
-                salesData.setDate(null);
-                break;
-            case "java.lang.Integer":
-                salesData.setMonthNumber(null);
-                salesData.setYear(null);
-                break;
-            case "java.lang.String":
-                break;
-            default:
-                logger.warn("Unhandled data type for nulling: {}", column.getDataType().getName());
-                break;
+            logger.error("Error setting field {}: {}", column, e.getMessage());
         }
     }
 

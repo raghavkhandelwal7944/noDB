@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 
 @RestController
 @RequestMapping("/api")
@@ -46,7 +47,7 @@ public class FileUploadController {
             // Call the async service method directly
             fileProcessorService.processFile(file, status.getId());
             // The status update to COMPLETED/FAILED will be handled by FileProcessorService
-        } catch (IOException | CsvValidationException | InterruptedException e) {
+        } catch (IOException | CsvValidationException | InterruptedException | ExecutionException e) {
             fileTrackerService.updateFileStatus(status.getId(), "FAILED", e.getMessage());
             System.err.println("File processing failed for " + file.getOriginalFilename() + ": " + e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("File upload failed: " + e.getMessage());

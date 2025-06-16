@@ -46,10 +46,7 @@ public class ColumnGuessingService {
      * @return A map where the key is the 0-indexed column index from the file and the value is the guessed SalesColumn.
      */
     public Map<Integer, SalesColumn> guessColumns(List<List<String>> sampleRows, Optional<List<String>> headerRow) {
-        logger.info("Starting column guessing with {} sample rows and header presence: {}", sampleRows.size(), headerRow.isPresent());
-        if (headerRow.isPresent()) {
-            logger.debug("Provided header row: {}", headerRow.get());
-        }
+        logger.info("Starting column guessing with {} sample rows", sampleRows.size());
 
         Map<Integer, SalesColumn> columnMapping = new HashMap<>();
         int numColumns = sampleRows.isEmpty() ? (headerRow.map(List::size).orElse(0)) : sampleRows.get(0).size();
@@ -64,8 +61,7 @@ public class ColumnGuessingService {
                     if (headerName.equalsIgnoreCase(salesColumn.getColumnName())) {
                         columnMapping.put(colIdx, salesColumn);
                         columnUsed[colIdx] = true;
-                        logger.debug("Header match found: Column '{}' mapped to SalesColumn {}", headerName, salesColumn);
-                        break; // Move to next header column
+                        break;
                     }
                 }
             }
@@ -75,7 +71,6 @@ public class ColumnGuessingService {
         // Prioritize guessing based on specific data types first (Date, Integer, BigDecimal)
         for (SalesColumn salesColumn : SalesColumn.values()) {
             if (!columnMapping.containsValue(salesColumn)) { // Only guess if not already mapped by header
-                logger.debug("Attempting to guess column for SalesColumn: {} (Data Type: {})", salesColumn.getColumnName(), salesColumn.getDataType().getSimpleName());
                 if (salesColumn.getDataType() == LocalDate.class) {
                     guessAndAssign(sampleRows, salesColumn, columnMapping, columnUsed, this::isLocalDate);
                 } else if (salesColumn.getDataType() == Integer.class) {
@@ -89,11 +84,9 @@ public class ColumnGuessingService {
         // Fill in remaining columns with String type if not already mapped
         for (SalesColumn salesColumn : SalesColumn.values()) {
             if (!columnMapping.containsValue(salesColumn) && salesColumn.getDataType() == String.class) {
-                logger.debug("Attempting to guess String column for SalesColumn: {}", salesColumn.getColumnName());
                 guessAndAssign(sampleRows, salesColumn, columnMapping, columnUsed, this::isString);
             }
         }
-        logger.info("Final guessed column mapping: {}", columnMapping);
         return columnMapping;
     }
 
@@ -105,7 +98,6 @@ public class ColumnGuessingService {
      * @return true if the row is likely a header, false otherwise.
      */
     public boolean isLikelyHeader(List<String> row) {
-        logger.debug("Checking if row is likely a header: {}", row);
         if (row == null || row.isEmpty()) {
             return false;
         }
@@ -134,7 +126,6 @@ public class ColumnGuessingService {
         }
 
         boolean result = (totalCells > 0 && (double) nonNumericCount / totalCells > 0.5) || recognizedHeaderCount > (SalesColumn.values().length / 3); // At least 1/3 of columns are recognized headers
-        logger.debug("isLikelyHeader result for row {}: {}", row, result);
         return result;
     }
 
@@ -148,7 +139,6 @@ public class ColumnGuessingService {
                     if (colIdx < row.size()) {
                         String cellValue = row.get(colIdx);
                         boolean isOfType = typeChecker.apply(cellValue);
-                        logger.debug("  Checking sample value '{}' (colIdx: {}) for type {}: {}", cellValue, colIdx, targetColumn.getDataType().getSimpleName(), isOfType);
                         if (cellValue != null && !cellValue.trim().isEmpty() && !isOfType) {
                             allMatch = false;
                             break;
@@ -158,7 +148,6 @@ public class ColumnGuessingService {
                 if (allMatch) {
                     columnMapping.put(colIdx, targetColumn);
                     columnUsed[colIdx] = true;
-                    logger.debug("Assigned column {} (Index: {}) to SalesColumn {}", targetColumn.getColumnName(), colIdx, targetColumn);
                     return; // Found a match for this targetColumn, move to next targetColumn
                 }
             }
@@ -166,7 +155,6 @@ public class ColumnGuessingService {
     }
 
     private boolean isLocalDate(String value) {
-        logger.debug("  Checking isLocalDate for value: '{}'", value);
         if (value == null || value.trim().isEmpty()) {
             return false; // Empty string is not a valid date
         }
@@ -174,7 +162,6 @@ public class ColumnGuessingService {
         for (String format : DATE_FORMATS) {
             try {
                 LocalDate.parse(trimmedValue, DateTimeFormatter.ofPattern(format));
-                logger.debug("    Value '{}' is a LocalDate with format {}", value, format);
                 return true;
             } catch (DateTimeParseException ignored) {
                 // Try next format
@@ -185,18 +172,15 @@ public class ColumnGuessingService {
         try {
             double excelDate = Double.parseDouble(trimmedValue);
             if (excelDate > 0 && excelDate < 100000) { // Reasonable range for Excel dates
-                logger.debug("    Value '{}' is an Excel numeric date.", value);
                 return true;
             }
         } catch (NumberFormatException ignored) {
             // Not an Excel date
         }
-        logger.debug("    Value '{}' is NOT a LocalDate.", value);
         return false;
     }
 
     private boolean isInteger(String value) {
-        logger.debug("  Checking isInteger for value: '{}'", value);
         if (value == null || value.trim().isEmpty()) {
             return false; // Empty string is not a valid integer
         }
@@ -207,23 +191,19 @@ public class ColumnGuessingService {
                                .replace(")", "");
 
         if (cleanValue.isEmpty() || cleanValue.equals("-")) {
-            logger.debug("    Cleaned value '{}' is empty or hyphen, NOT an Integer.", cleanValue);
             return false; // An empty string or a lone hyphen after cleaning is not an integer for guessing purposes
         }
 
         try {
             BigDecimal bd = new BigDecimal(cleanValue);
             boolean isWhole = bd.scale() <= 0 || bd.stripTrailingZeros().scale() <= 0; // Check if it's a whole number
-            logger.debug("    Value '{}' (cleaned: '{}') is Integer: {}", value, cleanValue, isWhole);
             return isWhole;
         } catch (NumberFormatException e) {
-            logger.debug("    Value '{}' (cleaned: '{}') is NOT an Integer. Error: {}", value, cleanValue, e.getMessage());
             return false;
         }
     }
 
     private boolean isBigDecimal(String value) {
-        logger.debug("  Checking isBigDecimal for value: '{}'", value);
         if (value == null || value.trim().isEmpty()) {
             return false; // Empty string is not a valid decimal
         }
@@ -234,22 +214,18 @@ public class ColumnGuessingService {
                                .replace(")", "");
 
         if (cleanValue.isEmpty() || cleanValue.equals("-")) {
-            logger.debug("    Cleaned value '{}' is empty or hyphen, NOT a BigDecimal.", cleanValue);
             return false; // An empty string or a lone hyphen after cleaning is not a BigDecimal for guessing purposes
         }
 
         try {
             new BigDecimal(cleanValue);
-            logger.debug("    Value '{}' (cleaned: '{}') is BigDecimal: true", value, cleanValue);
             return true;
         } catch (NumberFormatException e) {
-            logger.debug("    Value '{}' (cleaned: '{}') is NOT a BigDecimal. Error: {}", value, cleanValue, e.getMessage());
             return false;
         }
     }
 
     private boolean isString(String value) {
-        logger.debug("  Checking isString for value: '{}'", value);
         return true; // Any value can be a string
     }
 } 
